@@ -33,14 +33,38 @@ var (
 	GripperModelLite = family.WithModel(ModelNameGripperLite)
 )
 
+// Raw Fn700/Fn702 pulse thresholds. The register scale (0..850 over the full
+// stroke) is the same on G1 and G2 — only the millimetre mapping differs, and we
+// never expose millimetres — so these serve both. On G2 they are a fallback:
+// holding is read from the status register instead.
 const fullyClosedThreshold = 10
 const fullyOpenThreshold = 830
+const fullyOpenPosition = 840
+
+// G2 defaults. Speed is in raw Fn303/FnC01 pulses: UFactory's documented G2
+// default is 2000 (G1's is 1500, which we leave to the gripper's own firmware
+// rather than writing it). Force is the 1-100 percentage the SDKs default to in
+// set_gripper_g2_position.
+const (
+	defaultGripperSpeedG2 = 2000
+	defaultGripperForceG2 = 50
+)
+
+// gripperStatusTimeout bounds the G2 move poll, matching the SDKs' 10s default.
+const gripperStatusTimeout = 10 * time.Second
 
 // GripperConfig config for gripper.
 type GripperConfig struct {
 	Arm            string
 	VacuumLengthMM float64 `json:"vacuum_length_mm"`
 	GripperSpeed   int     `json:"gripper_speed,omitempty"`
+	// GripperVersion pins the standard gripper's hardware generation to "g1" or
+	// "g2", bypassing detection completely. Empty (the default) detects it by
+	// probing for force-control support.
+	GripperVersion string `json:"gripper_version,omitempty"`
+	// GripperForce is the G2 grasp force as a percentage, 1-100. Ignored on G1,
+	// which has no force register. 0 means defaultGripperForceG2.
+	GripperForce int `json:"gripper_force,omitempty"`
 	// ConnectionType overrides vacuum wiring detection: "plugin" or "contact".
 	// Empty means auto-detect from the arm model.
 	ConnectionType string `json:"connection_type,omitempty"`
@@ -63,6 +87,14 @@ func (cfg *GripperConfig) Validate(path string) ([]string, []string, error) {
 	}
 	if cfg.GripperSpeed != 0 && (cfg.GripperSpeed < 1 || cfg.GripperSpeed > 5000) {
 		return nil, nil, fmt.Errorf("gripper_speed must be between 1 and 5000, got %d", cfg.GripperSpeed)
+	}
+	switch cfg.GripperVersion {
+	case "", submodelG1, submodelG2:
+	default:
+		return nil, nil, fmt.Errorf(`gripper_version must be %q or %q, got %q`, submodelG1, submodelG2, cfg.GripperVersion)
+	}
+	if cfg.GripperForce != 0 && (cfg.GripperForce < 1 || cfg.GripperForce > 100) {
+		return nil, nil, fmt.Errorf("gripper_force must be between 1 and 100, got %d", cfg.GripperForce)
 	}
 	switch cfg.ConnectionType {
 	case "", string(connectionPlugin), string(connectionContact):
@@ -247,11 +279,21 @@ type myGripper struct {
 	useURDFs bool
 
 	arm arm.Arm
+	// xarm is the same object as arm, kept concretely so the gripper can drive the
+	// gripper Modbus bus itself instead of round-tripping semantic DoCommands. The
+	// arm supplies transport; which registers to write is this component's business.
+	xarm *xArm
 
 	goToPositionLock sync.Mutex
 	isMoving         atomic.Bool
 
 	detected detectedGripper
+	// version is submodelG1 or submodelG2 and selects the grasp protocol:
+	// G1 keeps the plain Fn700 position move plus a position-stall poll, G2 uses
+	// the FnCxx force block-write plus the status register.
+	version string
+	// speed and force are the resolved G2 FnCxx parameters. Unused on G1.
+	speed, force uint16
 
 	logger logging.Logger
 }
@@ -262,7 +304,27 @@ func newGripper(ctx context.Context, deps resource.Dependencies, config resource
 		return nil, err
 	}
 
-	mf, err := newGripperKinematics(ModelNameGripper, newConf, logger, standardGripperGeometries)
+	a, err := arm.FromProvider(deps, newConf.Arm)
+	if err != nil {
+		return nil, err
+	}
+
+	// Detection has to happen before the kinematics model is built: G1 and G2
+	// report different collision geometry. A gripper whose generation cannot be
+	// determined is a hard failure rather than a guess — see
+	// resolveStandardGripperVersion.
+	version, x, detected, err := resolveStandardGripperVersion(ctx, a, newConf.GripperVersion, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	if newConf.UseURDFs && version == submodelG2 {
+		logger.Warn("gripper: use_urdfs is set but only the G1 mesh ships, so this G2 will report G1 collision geometry; " +
+			"unset use_urdfs to get the G2 bounding boxes")
+	}
+	mf, err := newGripperKinematics(ModelNameGripper, newConf, logger, func() ([]spatialmath.Geometry, error) {
+		return standardGripperGeometries(version)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("gripper kinematics: %w", err)
 	}
@@ -271,20 +333,30 @@ func newGripper(ctx context.Context, deps resource.Dependencies, config resource
 		name:     config.ResourceName(),
 		mf:       mf,
 		useURDFs: newConf.UseURDFs,
+		arm:      a,
+		xarm:     x,
+		detected: detected,
+		version:  version,
+		force:    defaultGripperForceG2,
 		logger:   logger,
 	}
-
-	g.arm, err = arm.FromProvider(deps, newConf.Arm)
-	if err != nil {
-		return nil, err
+	if newConf.GripperForce != 0 {
+		g.force = uint16(newConf.GripperForce) //nolint:gosec // Validate bounds it to 1-100.
 	}
 
-	g.detected = probeGripper(ctx, g.arm, gripperKindStandard, logger)
-
+	// G1 keeps its historical behaviour: only write Fn303 when the user asked for a
+	// speed, otherwise leave the gripper on its own 1500 default. The G2 runs it
+	// unconditionally for the setupGripper side effect — the gripper has to be
+	// enabled before the first force-control write, and nothing else does that.
+	g.speed = defaultGripperSpeedG2
 	if newConf.GripperSpeed != 0 {
-		if _, err := g.arm.DoCommand(ctx, map[string]any{
-			setGripperSpeedKey: float64(newConf.GripperSpeed),
-		}); err != nil {
+		g.speed = uint16(newConf.GripperSpeed)
+	}
+	if newConf.GripperSpeed != 0 || version == submodelG2 {
+		if err := x.setupGripper(ctx); err != nil {
+			return nil, fmt.Errorf("failed to set up gripper: %w", err)
+		}
+		if err := x.setGripperSpeed(ctx, g.speed); err != nil {
 			return nil, fmt.Errorf("failed to set gripper speed: %w", err)
 		}
 	}
@@ -293,6 +365,15 @@ func newGripper(ctx context.Context, deps resource.Dependencies, config resource
 }
 
 func (g *myGripper) Grab(ctx context.Context, extra map[string]any) (bool, error) {
+	// G2 closes to 0, matching the SDK's clamp; G1 keeps its historical target of 2.
+	if g.version == submodelG2 {
+		status, err := g.moveG2(ctx, 0)
+		if err != nil {
+			return false, err
+		}
+		return status&gripperStateMask == gripperStateDetected, nil
+	}
+
 	pos, err := g.goToPosition(ctx, 2)
 	if err != nil {
 		return false, err
@@ -302,14 +383,41 @@ func (g *myGripper) Grab(ctx context.Context, extra map[string]any) (bool, error
 }
 
 func (g *myGripper) Open(ctx context.Context, extra map[string]any) error {
-	_, err := g.goToPosition(ctx, 840)
+	if g.version == submodelG2 {
+		_, err := g.moveG2(ctx, fullyOpenPosition)
+		return err
+	}
+
+	_, err := g.goToPosition(ctx, fullyOpenPosition)
 	return err
 }
 
+// IsHoldingSomething reports the G2's own object-detected bit, which is
+// authoritative the instant it is read. The G1 has no status register, so it
+// keeps inferring holding from where the jaws came to rest.
 func (g *myGripper) IsHoldingSomething(
 	ctx context.Context,
 	extra map[string]any,
 ) (gripper.HoldingStatus, error) {
+	if g.version == submodelG2 {
+		status, err := g.getStatus(ctx)
+		if err != nil {
+			return gripper.HoldingStatus{}, err
+		}
+		meta := map[string]any{"status": status}
+		// Position is best-effort here: it is useful telemetry but must not turn
+		// a good holding answer into an error.
+		if pos, err := g.getPosition(ctx); err == nil {
+			meta["position"] = pos
+		} else {
+			g.logger.Debugf("gripper position read failed during IsHoldingSomething: %v", err)
+		}
+		return gripper.HoldingStatus{
+			IsHoldingSomething: status&gripperStateMask == gripperStateDetected,
+			Meta:               meta,
+		}, nil
+	}
+
 	pos, err := g.getPosition(ctx)
 	if err != nil {
 		return gripper.HoldingStatus{}, err
@@ -325,6 +433,103 @@ func (g *myGripper) IsHoldingSomething(
 	}, nil
 }
 
+// gripperForceControlRegs is the FnCxx block: enable, speed, force, position
+// high, position low. Writing it applies force atomically with the move — the G1
+// has no equivalent, which is also how the two are told apart.
+const gripperForceControlRegs = 5
+
+// writeForceControlBlock issues the G2 grasp write. Clearing FnC00 first makes the
+// firmware see a 0->1 transition on the new write; without it, back-to-back
+// grasps can be ignored while a hold is active.
+//
+// Package-level rather than a method so the arm's grab_with_torque DoCommand can
+// share the one definition of this frame.
+func writeForceControlBlock(ctx context.Context, x *xArm, speed, force uint16, position uint32) error {
+	if err := x.disableGripperControlMode(ctx); err != nil {
+		return err
+	}
+	return x.writeGripperRegisters(ctx, gripperControlModeReg, []uint16{
+		1,
+		speed,
+		force,
+		uint16(position >> 16),    //nolint:gosec // split of a 32-bit value.
+		uint16(position & 0xFFFF), //nolint:gosec
+	})
+}
+
+// moveG2 issues the force block-write and waits on the status register,
+// returning the status that ended the move.
+func (g *myGripper) moveG2(ctx context.Context, goal int) (uint16, error) {
+	g.goToPositionLock.Lock()
+	defer g.goToPositionLock.Unlock()
+
+	g.isMoving.Store(true)
+	defer g.isMoving.Store(false)
+
+	if err := writeForceControlBlock(ctx, g.xarm, g.speed, g.force, uint32(goal)); err != nil { //nolint:gosec // goal is 0..850.
+		return 0, err
+	}
+
+	return g.waitForStatus(ctx, gripperStatusTimeout)
+}
+
+// waitForStatus mirrors _check_gripper_status in both UFactory SDKs: a move is
+// only complete once the controller has reported IS_MOTION and then settled back
+// to IS_STOP or IS_DETECTED. Treating the first idle reading as "done" is what
+// forced callers to sleep before IsHoldingSomething — immediately after the
+// write the gripper has not begun moving, so its status and position still
+// describe the previous pose. If motion never starts (already at the goal), the
+// SDKs give up after 20 polls and call it done; we do the same.
+func (g *myGripper) waitForStatus(ctx context.Context, timeout time.Duration) (uint16, error) {
+	const pollInterval = 100 * time.Millisecond
+	const notStartedPolls = 20
+
+	started := false
+	notStarted := 0
+	deadline := time.Now().Add(timeout)
+	var status uint16
+
+	for time.Now().Before(deadline) {
+		if !utils.SelectContextOrWait(ctx, pollInterval) {
+			return status, ctx.Err()
+		}
+		var err error
+		if status, err = g.getStatus(ctx); err != nil {
+			return status, err
+		}
+		switch status & gripperStateMask {
+		case gripperStateFault:
+			return status, fmt.Errorf("gripper reported a fault (status 0x%04x)", status)
+		case gripperStateMotion:
+			started = true
+		default: // gripperStateStop or gripperStateDetected
+			if started {
+				return status, nil
+			}
+			notStarted++
+			if notStarted >= notStartedPolls {
+				return status, nil
+			}
+		}
+	}
+	return status, fmt.Errorf("gripper move did not complete within %s (status 0x%04x)", timeout, status)
+}
+
+func (g *myGripper) getStatus(ctx context.Context) (uint16, error) {
+	r, err := g.xarm.readGripperRegisters(ctx, standardGripperStatusReg, 1)
+	if err != nil {
+		return 0, err
+	}
+	if r.exception != 0 {
+		return 0, fmt.Errorf("gripper status read rejected with Modbus exception 0x%02X (%v)", r.exception, r.params)
+	}
+	w := r.words()
+	if len(w) != 1 {
+		return 0, fmt.Errorf("bad gripper status response %v", r.params)
+	}
+	return w[0], nil
+}
+
 func (g *myGripper) goToPosition(ctx context.Context, goal int) (int, error) {
 	g.goToPositionLock.Lock()
 	defer g.goToPositionLock.Unlock()
@@ -332,11 +537,10 @@ func (g *myGripper) goToPosition(ctx context.Context, goal int) (int, error) {
 	g.isMoving.Store(true)
 	defer g.isMoving.Store(false)
 
-	_, err := g.arm.DoCommand(ctx, map[string]any{
-		"setup_gripper": true,
-		"move_gripper":  float64(goal),
-	})
-	if err != nil {
+	if err := g.xarm.setupGripper(ctx); err != nil {
+		return 0, err
+	}
+	if err := g.xarm.setGripperPosition(ctx, uint32(goal)); err != nil { //nolint:gosec // goal is 0..850.
 		return 0, err
 	}
 
@@ -378,19 +582,8 @@ func (g *myGripper) goToPosition(ctx context.Context, goal int) (int, error) {
 }
 
 func (g *myGripper) getPosition(ctx context.Context) (int, error) {
-	res, err := g.arm.DoCommand(ctx, map[string]any{
-		getGripperKey: true,
-	})
-	if err != nil {
-		return 0, err
-	}
-
-	raw := res[gripperPositionKey]
-	pos, ok := raw.(float64)
-	if !ok {
-		return 0, fmt.Errorf("bad gripper_position (%v) %T", raw, raw)
-	}
-	return int(pos), nil
+	pos, err := g.xarm.getGripperPosition(ctx)
+	return int(pos), err
 }
 
 func (g *myGripper) Name() resource.Name {
@@ -452,7 +645,7 @@ func (g *myGripper) Geometries(ctx context.Context, _ map[string]any) ([]spatial
 		}
 		return gif.Geometries(), nil
 	}
-	return standardGripperGeometries()
+	return standardGripperGeometries(g.version)
 }
 
 func (g *myGripper) Kinematics(ctx context.Context) (referenceframe.Model, error) {
@@ -471,17 +664,20 @@ func (g *myGripper) Status(_ context.Context) (map[string]any, error) {
 	return map[string]any{}, nil
 }
 
-// standardGripperGeometries returns hand-authored bounding boxes for the
-// housing and open-jaw envelope. Used when use_urdfs is false.
-func standardGripperGeometries() ([]spatialmath.Geometry, error) {
+func standardGripperGeometries(version string) ([]spatialmath.Geometry, error) {
 	caseBoxSize := r3.Vector{X: 50, Y: 100, Z: 100}
+	clawSize := r3.Vector{X: 40, Y: 170, Z: 105}
+	if version == submodelG2 {
+		caseBoxSize = r3.Vector{X: 75, Y: 110, Z: 110}
+		clawSize = r3.Vector{X: 45, Y: 120, Z: 112}
+	}
+
 	caseBox, err := spatialmath.NewBox(
 		spatialmath.NewPoseFromPoint(r3.Vector{X: 0, Y: 0, Z: caseBoxSize.Z / -2}),
 		caseBoxSize, "case-gripper")
 	if err != nil {
 		return nil, err
 	}
-	clawSize := r3.Vector{X: 40, Y: 170, Z: 105}
 	claws, err := spatialmath.NewBox(
 		spatialmath.NewPoseFromPoint(r3.Vector{Z: 50 + (clawSize.Z / -2)}),
 		clawSize, "claws")
